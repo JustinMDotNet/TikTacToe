@@ -52,7 +52,11 @@ PREALLOC_CHOICES: tuple[int, ...] = (1, 2, 3)  # markers per player at start
 # ---------------------------------------------------------------------------
 DEFAULT_DEPTH: int = 3        # alpha-beta cutoff depth (per ply)
 DEPTH_SWEEP: tuple[int, ...] = (1, 2, 3)
-TUNING_DEPTH: int = 3         # match deployment depth so tuned weights transfer
+TUNING_DEPTH: int = 2         # tune cheap at d=2 (~10x faster than d=3);
+                              # the validation cell in notebook 03 re-plays
+                              # the top candidates at DEFAULT_DEPTH and falls
+                              # back to defaults if none transfers, so
+                              # depth-mismatch risk is bounded.
 
 # ---------------------------------------------------------------------------
 # Heuristic weights (tuned in notebook 03)
@@ -78,6 +82,15 @@ DEFAULT_HEURISTIC_WEIGHTS: dict[str, float] = {
 # ---------------------------------------------------------------------------
 RANDOM_SEED: int = 42
 N_GAMES_PER_CONFIG: int = 80  # used in notebook 03/04 sweeps
+N_TUNING_GAMES: int = 80      # per-candidate games in Exp C. expC is a
+                              # cheap *screen* at TUNING_DEPTH=2 -- the real
+                              # statistical work happens in the validation
+                              # cell, which re-plays the top-K at
+                              # DEFAULT_DEPTH with fresh seeds. Wilson
+                              # interval at N=80 is +/-0.11, fine for
+                              # ranking the top few of 38 candidates.
+N_RANDOM_CANDIDATES: int = 20 # extra random-search candidates added
+                              # alongside the 18-cell weight grid
 
 # When True, notebook 03 ignores cache/results/*.pkl and recomputes every
 # experiment from scratch. Leave False unless you've changed the heuristic,
@@ -100,6 +113,7 @@ __all__ = [
     "ensure_aima_on_path",
     "BOARD_SIZE", "WIN_LENGTH", "PREALLOC_CHOICES",
     "DEFAULT_DEPTH", "DEPTH_SWEEP", "TUNING_DEPTH", "DEFAULT_HEURISTIC_WEIGHTS",
-    "RANDOM_SEED", "N_GAMES_PER_CONFIG",
+    "RANDOM_SEED", "N_GAMES_PER_CONFIG", "N_TUNING_GAMES",
+    "N_RANDOM_CANDIDATES",
     "cache_path",
 ]

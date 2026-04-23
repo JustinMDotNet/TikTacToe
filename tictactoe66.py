@@ -25,6 +25,93 @@ settings.ensure_aima_on_path()
 
 from games4e import TicTacToe, GameState, alpha_beta_cutoff_search  # noqa: E402
 
+# ---------------------------------------------------------------------------
+# Numba kernel for the inner heuristic loop.
+# Profiling shows the heuristic is called millions of times during Exp C, and
+# almost all of its runtime is in two pure-Python loops over the line list.
+# A jitted kernel that operates on a flat int8 board removes the dict lookups
+# and lets the compiler vectorize the inner counting, which buys ~5-10x in
+# our measurements.  We fall back to the pure-Python path if numba is not
+# available so the module still imports cleanly in a stripped environment.
+# ---------------------------------------------------------------------------
+import numpy as _np
+
+try:
+    from numba import njit as _njit
+    _HAVE_NUMBA = True
+except Exception:  # pragma: no cover -- exercised only when numba is missing
+    _HAVE_NUMBA = False
+    def _njit(*a, **kw):
+        def deco(fn):
+            return fn
+        return deco
+
+
+@_njit(cache=True)
+def _score_board_kernel(board_flat, lines_idx, open5_idx, center_idx,
+                        me_sign,
+                        w_two, w_three, w_block_two, w_block_three,
+                        w_open, w_block_open, w_center):
+    """Numba-jitted scoring loop.  See ``Heuristic.__call__`` for semantics.
+
+    All weights and ``me_sign`` are scalars; the index arrays are precomputed
+    once per game instance.  ``open5_idx`` may be empty (shape (0, 5)) when
+    the open-three weights are both zero -- the loop below handles that.
+    """
+    score = 0.0
+    n_lines = lines_idx.shape[0]
+    line_len = lines_idx.shape[1]
+    for li in range(n_lines):
+        mine = 0
+        theirs = 0
+        for j in range(line_len):
+            v = board_flat[lines_idx[li, j]]
+            if v == me_sign:
+                mine += 1
+            elif v == -me_sign and v != 0:
+                theirs += 1
+        if theirs == 0 and mine > 0:
+            if mine == 2:
+                score += w_two
+            elif mine == 3:
+                score += w_three
+        elif mine == 0 and theirs > 0:
+            if theirs == 2:
+                score -= w_block_two
+            elif theirs == 3:
+                score -= w_block_three
+
+    n_open = open5_idx.shape[0]
+    if n_open > 0 and (w_open != 0.0 or w_block_open != 0.0):
+        ow = open5_idx.shape[1]
+        for wi in range(n_open):
+            left = board_flat[open5_idx[wi, 0]]
+            right = board_flat[open5_idx[wi, ow - 1]]
+            if left != 0 or right != 0:
+                continue
+            mine_inner = 0
+            theirs_inner = 0
+            for j in range(1, ow - 1):
+                v = board_flat[open5_idx[wi, j]]
+                if v == me_sign:
+                    mine_inner += 1
+                elif v == -me_sign and v != 0:
+                    theirs_inner += 1
+            inner_len = ow - 2
+            if mine_inner == inner_len:
+                score += w_open
+            elif theirs_inner == inner_len:
+                score -= w_block_open
+
+    for ci in range(center_idx.shape[0]):
+        v = board_flat[center_idx[ci]]
+        if v == me_sign:
+            score += w_center
+        elif v == -me_sign and v != 0:
+            score -= w_center
+
+    return score
+
 
 # ---------------------------------------------------------------------------
 # Game class
@@ -45,6 +132,35 @@ class TicTacToe66(TicTacToe):
                  v: int = settings.BOARD_SIZE,
                  k: int = settings.WIN_LENGTH):
         super().__init__(h=h, v=v, k=k)
+        self._idx_cache = None
+
+    # -- numba index arrays (computed once per game instance) --------------
+    def _build_idx_arrays(self):
+        """Return ``(lines_idx, open5_idx, center_idx)`` as numpy int32
+        arrays of flat board indices, suitable for the numba kernel."""
+        if self._idx_cache is not None:
+            return self._idx_cache
+        v = self.v
+        def flat(rc):
+            r, c = rc
+            return (r - 1) * v + (c - 1)
+        lines_idx = _np.array(
+            [[flat(c) for c in line] for line in self.lines()],
+            dtype=_np.int32)
+        opens = self.open_three_windows()
+        if opens:
+            open5_idx = _np.array(
+                [[flat(c) for c in win] for win in opens], dtype=_np.int32)
+        else:
+            open5_idx = _np.zeros((0, self.k + 1), dtype=_np.int32)
+        cx_lo = self.h // 2
+        cy_lo = self.v // 2
+        center_cells = [(cx_lo, cy_lo), (cx_lo, cy_lo + 1),
+                        (cx_lo + 1, cy_lo), (cx_lo + 1, cy_lo + 1)]
+        center_idx = _np.array([flat(c) for c in center_cells],
+                               dtype=_np.int32)
+        self._idx_cache = (lines_idx, open5_idx, center_idx)
+        return self._idx_cache
 
     # -- pretty display ----------------------------------------------------
     def display(self, state: GameState) -> None:
@@ -225,70 +341,40 @@ class Heuristic:
 
     # ------------------------------------------------------------------
     def __call__(self, state: GameState) -> float:
+        """Score ``state`` from ``self.perspective``'s point of view.
+
+        Returns a positive value when the position favors the player named
+        by ``self.perspective`` ('X' or 'O') and a negative value otherwise.
+        ``alpha_beta_cutoff_search`` expects evaluations from the side to
+        move's perspective, so callers using ``make_alpha_beta_player``
+        construct one ``Heuristic`` per move with ``perspective=state.to_move``
+        (the wrapping is handled by ``make_alpha_beta_player`` itself).
+        """
         # Terminal short-circuit: use the cached utility * a big weight.
         if state.utility != 0:
             sign = +1 if self.perspective == 'X' else -1
             return sign * state.utility * self.weights["w_win"]
 
-        score = 0.0
-        board = state.board
-        opp = 'O' if self.perspective == 'X' else 'X'
-        me = self.perspective
+        # Convert the dict-board to a flat int8 array (1 = X, -1 = O, 0 = empty)
+        # and dispatch to the jitted kernel.  The conversion cost (36 dict
+        # lookups) is negligible next to the savings inside the kernel.
+        v = self.game.v
+        board_flat = _np.zeros(self.game.h * self.game.v, dtype=_np.int8)
+        for (r, c), marker in state.board.items():
+            board_flat[(r - 1) * v + (c - 1)] = 1 if marker == 'X' else -1
+
+        lines_idx, open5_idx, center_idx = self.game._build_idx_arrays()
+        me_sign = 1 if self.perspective == 'X' else -1
 
         w = self.weights
-        for line in self.game.lines():
-            mine = 0
-            theirs = 0
-            for cell in line:
-                v = board.get(cell)
-                if v == me:
-                    mine += 1
-                elif v == opp:
-                    theirs += 1
-            # Only "open" or "half-open" windows (no enemy markers) for own
-            # threats; symmetric for blocking opponent threats.
-            if theirs == 0 and mine > 0:
-                if mine == 2:
-                    score += w["w_two"]
-                elif mine == 3:
-                    score += w["w_three"]
-                elif mine >= self.game.k:
-                    score += w["w_win"]
-            if mine == 0 and theirs > 0:
-                if theirs == 2:
-                    score -= w["w_block_two"]
-                elif theirs == 3:
-                    score -= w["w_block_three"]
-                elif theirs >= self.game.k:
-                    score -= w["w_win"]
-
-        # Open-3 detection: scan length-(k+1) windows and look for the
-        # _XXX_ pattern (inner three contiguous own markers, both flanks
-        # empty).  Such a configuration cannot be blocked in one move.
-        w_open = w.get("w_open_three", 0.0)
-        w_block_open = w.get("w_block_open_three", 0.0)
-        if w_open or w_block_open:
-            for win in self.game.open_three_windows():
-                left, *inner, right = (board.get(c) for c in win)
-                if left is not None or right is not None:
-                    continue
-                if all(v == me for v in inner):
-                    score += w_open
-                elif all(v == opp for v in inner):
-                    score -= w_block_open
-
-        # Center control bonus: count own markers in the central 2x2 block.
-        cx_lo = self.game.h // 2
-        cy_lo = self.game.v // 2
-        center_cells = [(cx_lo, cy_lo), (cx_lo, cy_lo + 1),
-                        (cx_lo + 1, cy_lo), (cx_lo + 1, cy_lo + 1)]
-        for c in center_cells:
-            v = board.get(c)
-            if v == me:
-                score += w["w_center"]
-            elif v == opp:
-                score -= w["w_center"]
-        return score
+        return _score_board_kernel(
+            board_flat, lines_idx, open5_idx, center_idx, me_sign,
+            float(w["w_two"]), float(w["w_three"]),
+            float(w["w_block_two"]), float(w["w_block_three"]),
+            float(w.get("w_open_three", 0.0)),
+            float(w.get("w_block_open_three", 0.0)),
+            float(w["w_center"]),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -310,8 +396,21 @@ def make_alpha_beta_player(depth: int = settings.DEFAULT_DEPTH,
     return player
 
 
+def make_random_player(rng: random.Random | None = None,
+                       name: str = 'random_legal_player'):
+    """Build a random-move player bound to a specific RNG so seeded matches
+    are fully reproducible across worker processes."""
+    local_rng = rng if rng is not None else random
+    def player(game: TicTacToe66, state: GameState):
+        return local_rng.choice(state.moves)
+    player.__name__ = name
+    return player
+
+
 def random_legal_player(game: TicTacToe66, state: GameState):
-    """Uniformly random player among legal moves (baseline opponent)."""
+    """Uniformly random player using the module-global RNG.  Kept for
+    convenience in single-game demos; parallel runs should use
+    ``make_random_player(rng)`` to stay reproducible per seed."""
     return random.choice(state.moves)
 
 
@@ -374,17 +473,17 @@ def _play_one_worker(args: tuple) -> dict:
     spec_a, spec_b, n_prealloc, seed, a_is_X, game_idx = args
     game = TicTacToe66()
 
+    rng = random.Random(seed)
+
     def _build(spec):
         if spec == "random":
-            return random_legal_player
+            return make_random_player(rng=rng)
         depth, weights = spec
         return make_alpha_beta_player(depth=depth, weights=weights)
 
     player_a = _build(spec_a)
     player_b = _build(spec_b)
     x_player, o_player = (player_a, player_b) if a_is_X else (player_b, player_a)
-
-    rng = random.Random(seed)
     t0 = _time.perf_counter()
     result = play_one_game(game, x_player, o_player, n_prealloc=n_prealloc, rng=rng)
     result["seconds"] = _time.perf_counter() - t0
@@ -404,6 +503,6 @@ def _play_one_worker(args: tuple) -> dict:
 
 __all__ = [
     "TicTacToe66", "make_initial_state", "Heuristic",
-    "make_alpha_beta_player", "random_legal_player",
+    "make_alpha_beta_player", "random_legal_player", "make_random_player",
     "play_one_game", "_play_one_worker",
 ]
